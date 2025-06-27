@@ -6,28 +6,43 @@ module Main where
 import Control.Applicative
 import Data.Char (isAlpha, isDigit, isSpace)
 
+{-
+  This program parses a list of rules given in 'rules.rkt' file into a format that the rust egg library understands
+  The main function of this is convert the herbie rules (which are written in racket) to rules that can be used in egg.
+
+  To parse this we use parser combinators.
+  A parts of code were borrowed from:
+  https://github.com/tsoding/haskell-json/blob/master/Main.hs
+
+-}
+
+-- this data structure keeps track of the file input and the charecter that we are at
 data Input = Input
   { inputLoc :: Int,
     inputStr :: String
   }
   deriving (Show, Eq)
 
--- | Pull the first character of the input if there is one still input
+-- | this function is used to get a character from an input and maintain the current column...
 inputUncons ::
   Input -> -- input to check
   Maybe (Char, Input)
 inputUncons (Input _ []) = Nothing
 inputUncons (Input loc (x : xs)) = Just (x, Input (loc + 1) xs)
 
+-- Main definition of a rule
+-- A rule is of the form:
+-- ["rule-name" left-expr right-expr]
 data Rule = Rule String Expr Expr deriving (Show, Eq)
 
+-- Main structure of a rule
 data Expr
-  = Num Int
-  | Frac Int Int
-  | Var String
-  | Pi
-  | E
-  | Op OpType
+  = Num Int -- interger literals
+  | Frac Int Int -- fraction of the form int/int
+  | Var String -- variable name
+  | Pi -- the pi constant
+  | E -- euler's constat
+  | Op OpType -- an operation
   deriving (Show, Eq)
 
 data OpType
@@ -36,16 +51,16 @@ data OpType
   | Mul Expr Expr
   | Div Expr Expr
   | Pow Expr Expr
-  | Copysign Expr Expr
-  | Neg Expr
+  | Copysign Expr Expr -- copysign, like https://en.cppreference.com/w/cpp/numeric/math/copysign
+  | Neg Expr -- negation of a number
   | Sqrt Expr
-  | Cbrt Expr
-  | Fabs Expr
-  | FMin Expr Expr
-  | FMax Expr Expr
-  | Exp Expr
-  | Log Expr
-  | Sin Expr
+  | Cbrt Expr -- cube root
+  | Fabs Expr -- floating point absolute value
+  | FMin Expr Expr -- min
+  | FMax Expr Expr -- max
+  | Exp Expr -- exponentiation
+  | Log Expr -- natural lo
+  | Sin Expr -- Trig functions ...
   | Cos Expr
   | Tan Expr
   | Asin Expr
@@ -61,11 +76,14 @@ data OpType
   | Remainder Expr Expr
   deriving (Show, Eq)
 
+-- definition of parser
 data ParserError = ParserError Int String deriving (Show)
 
 newtype Parser a = Parser
   { runParser :: Input -> Either ParserError (Input, a)
   }
+
+-- Our parser implements Functor, Applicative, Alternative
 
 instance Functor Parser where
   fmap f (Parser p) =
@@ -91,8 +109,9 @@ instance Alternative Parser where
   (Parser p1) <|> (Parser p2) =
     Parser $ \input -> p1 input <|> p2 input
 
+-- Parser for a signle character
 charP ::
-  Char -> -- The single character to find in the input
+  Char ->
   Parser Char
 charP x = Parser f
   where
@@ -109,9 +128,9 @@ charP x = Parser f
           (inputLoc input)
           ("Expected '" ++ [x] ++ "', but reached end of string")
 
--- | Create a parser for a specific string
+-- Parse for a given string
 stringP ::
-  String -> -- String to find in the input
+  String ->
   Parser String
 stringP str =
   Parser $ \input ->
@@ -123,8 +142,9 @@ stringP str =
             ("Expected \"" ++ str ++ "\", but found \"" ++ inputStr input ++ "\"")
       result -> result
 
+-- parse a single charecter that fullfills condition
 parseIf ::
-  String -> -- Description of the predicate
+  String -> -- name of the predicate
   (Char -> Bool) -> -- predicate
   Parser Char
 parseIf desc f =
@@ -143,9 +163,11 @@ parseIf desc f =
             (inputLoc input)
             ("Expected " ++ desc ++ ", but reached end of string")
 
+-- parse whitespaces
 ws :: Parser String
 ws = many $ parseIf "whitespace character" isSpace
 
+-- parse an integer
 numP :: Parser Int
 numP = (*) <$> signVal <*> (read <$> digits)
   where
@@ -169,6 +191,7 @@ parsePi = Pi <$ stringP "(PI)"
 parseE :: Parser Expr
 parseE = Pi <$ stringP "(E)"
 
+-- all of the operation parsers
 parseOp :: Parser Expr
 parseOp = Op <$> (charP '(' *> ws *> op <* ws <* charP ')')
   where

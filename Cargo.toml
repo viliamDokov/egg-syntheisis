@@ -5,5 +5,4 @@ edition = "2024"
 
 [dependencies]
 egg = "0.10.0"
-microlp = "0.2.11"
 russcip = { version = "0.8.2", features = ["bundled"] }
