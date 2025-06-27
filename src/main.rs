@@ -1,6 +1,6 @@
-use std::time::Duration;
-
 use egg::*;
+use microlp::*;
+use std::{collections::HashMap, thread::sleep, time::Duration};
 
 define_language! {
     enum MathLanguage {
@@ -41,7 +41,7 @@ define_language! {
     }
 }
 
-fn make_rules() -> Vec<Rewrite<MathLanguage, ()>> {
+fn make_rules() -> Vec<Rewrite<MathLanguage, ComposionTracking>> {
     vec![
         rewrite!("associate-+r+"; "(+ ?a (+ ?b ?c))" => "(+ (+ ?a ?b) ?c)"),
         rewrite!("associate-+l+"; "(+ (+ ?a ?b) ?c)" => "(+ ?a (+ ?b ?c))"),
@@ -466,9 +466,40 @@ fn make_rules() -> Vec<Rewrite<MathLanguage, ()>> {
         rewrite!("cosh-atanh-rev"; "(/ 1 (sqrt (- 1 (* ?x ?x))))" => "(cosh (atanh ?x))"),
         rewrite!("asinh-2"; "(acosh (+ (* 2 (* ?x ?x)) 1))" => "(* 2 (asinh (fabs ?x)))"),
         rewrite!("acosh-2-rev"; "(* 2 (acosh ?x))" => "(acosh (- (* 2 (* ?x ?x)) 1))"),
-        rewrite!("the-func"; "(thefunc ?x)" => "(- (sin ?x) (tan ?x))"),
-        rewrite!("the-func2"; "(- (sin ?x) (tan ?x))" => "(thefunc ?x)"),
     ]
+}
+
+// in this case, our analysis itself doesn't require any data, so we can just
+// use a unit struct and derive Default
+#[derive(Default)]
+struct ComposionTracking;
+impl Analysis<MathLanguage> for ComposionTracking {
+    type Data = Vec<(usize, usize)>;
+
+    fn merge(&mut self, to: &mut Self::Data, from: Self::Data) -> DidMerge {
+        let old_to = to.len();
+        let old_from = from.len();
+        for node in from {
+            if !to.contains(&node) {
+                to.push(node);
+            }
+        }
+        DidMerge(old_to != to.len(), old_from != to.len())
+    }
+
+    fn make(egraph: &mut EGraph<MathLanguage, Self>, enode: &MathLanguage) -> Self::Data {
+        vec![]
+    }
+
+    fn modify(egraph: &mut EGraph<MathLanguage, Self>, id: Id) {}
+}
+
+fn get_composed<'a>(
+    egraph: &'a EGraph<MathLanguage, ComposionTracking>,
+    expr: &RecExpr<MathLanguage>,
+) -> &'a Vec<(usize, usize)> {
+    let eClass = egraph.lookup_expr(expr).unwrap();
+    return &egraph[eClass].data;
 }
 
 // You could use egg::AstSize, but this is useful for debugging, since
@@ -482,62 +513,391 @@ impl egg::CostFunction<MathLanguage> for CostFn {
     {
         // We really like using thefunc
         let op_cost = match enode {
-            MathLanguage::Thefunc(..) => 0,
-            _ => 100,
+            MathLanguage::Thefunc(..) => 1 + enode.fold(0, |sum, i| sum + costs(i)),
+            _ => 10 + 10 * enode.fold(0, |sum, i| sum + costs(i)),
         };
-        enode.fold(op_cost, |sum, i| sum + costs(i))
+        op_cost
     }
 }
 
-fn main() {
-    // let start = "(sin x)".parse().unwrap();
-    // let end = "(neg (sin (neg x)))".parse().unwrap();
+fn extract_expressions(start_pattern: Pattern<MathLanguage>) -> Vec<RecExpr<MathLanguage>> {
+    let mut thefunc_rules = make_rules();
+    let thefunc_pattern: Pattern<MathLanguage> = "(thefunc ?x)".parse().unwrap();
+    let rule_to =
+        Rewrite::new("to-thefunc", start_pattern.clone(), thefunc_pattern.clone()).unwrap();
+    let rule_from = Rewrite::new(
+        "from-thefunc",
+        thefunc_pattern.clone(),
+        start_pattern.clone(),
+    )
+    .unwrap();
+    thefunc_rules.push(rule_to);
+    thefunc_rules.push(rule_from);
 
-    // let start = "(tan x)".parse().unwrap();
-    // let end = "(neg (tan (neg x)))".parse().unwrap();
-
-    // let start = "(neg (- x y))".parse().unwrap();
-    // let end = "(- (neg x) (neg y))".parse().unwrap();
-
-    let end = "(neg (thefunc (neg x)))".parse().unwrap();
+    println!("Finidng Equivalences!");
     let start = "(thefunc x)".parse().unwrap();
-
-    let mut runner = Runner::default()
+    let inital_runner = Runner::default()
         .with_node_limit(1_000_000)
-        .with_time_limit(Duration::new(5, 0))
+        .with_iter_limit(7)
+        // .with_time_limit(Duration::new(2, 0))
         .with_explanations_enabled()
         .with_expr(&start)
-        .run(&make_rules());
+        .run(&thefunc_rules);
+    println!("{}", inital_runner.report());
 
-    runner.explain_equivalence(&start, &end);
-
-    let egraph = &runner.egraph;
-    let root = runner.roots[0];
+    let egraph = &inital_runner.egraph;
+    let root = inital_runner.roots[0];
     let class = &egraph[root];
 
-    println!("FOO!");
-    let mut extractor = Extractor::new(&egraph, CostFn);
-    let getVal = |id| {
+    let extractor = Extractor::new(&egraph, CostFn);
+    let get_node = |id| {
         let node = extractor.find_best_node(id);
+        // sleep(Duration::from_millis(100));
+        // println!("Getting: {id} {node:?}");
         return node.clone();
     };
 
-    for node in class.iter() {
-        let expr = node.build_recexpr(getVal);
-        println!("NODE: {expr}");
+    fn contains_thefun(expr: &RecExpr<MathLanguage>) -> bool {
+        expr.iter().any(|node| match node {
+            MathLanguage::Thefunc(..) => true,
+            _ => false,
+        })
     }
 
-    let stop_reason = runner.stop_reason.clone().unwrap();
-    let expressions = class.len();
-    let iterations = runner.iterations.len();
-    let nodes = egraph.nodes().len();
-    runner.print_report();
-    println!("Found: {expressions}");
-    println!("Stop reason: {stop_reason:?}");
+    println!("Starting node {root}");
+    let expressions: Vec<RecExpr<MathLanguage>> = class
+        .iter()
+        .map(|node| node.build_recexpr(get_node))
+        .filter(contains_thefun)
+        .collect();
 
-    let foo = "(thefunc (neg x))".parse().unwrap();
-    let expr = egraph.lookup_expr(&foo).unwrap();
-    let node = extractor.find_best_node(expr);
-    let recExpr = node.build_recexpr(getVal);
-    println!("Expr {}", recExpr);
+    println!("Found {} base expressions", expressions.len());
+    for res in expressions.iter() {
+        println!("EXPR: {res}");
+    }
+
+    let mut duplicate_runner = Runner::default()
+        .with_node_limit(1_000_000)
+        .with_time_limit(Duration::new(10, 0));
+
+    for node in expressions.iter() {
+        duplicate_runner = duplicate_runner.with_expr(&node);
+    }
+
+    println!("Deduplicating expressions...");
+    duplicate_runner = duplicate_runner.run(&make_rules());
+    println!("{}", duplicate_runner.report());
+
+    let duplicate_egg = duplicate_runner.egraph;
+
+    let deduplicated_exressions: Vec<RecExpr<MathLanguage>> = expressions
+        .iter()
+        .filter(|expr| duplicate_egg.equivs(&expr, &start).len() == 0)
+        .cloned()
+        .collect();
+
+    println!(
+        "Found {} deduplicated expressions",
+        deduplicated_exressions.len()
+    );
+
+    let src = &deduplicated_exressions[0];
+    let mut composition_runner = Runner::default()
+        .with_node_limit(1_000_000)
+        .with_time_limit(Duration::new(10, 0));
+
+    let mut composition_egraph = EGraph::default().with_explanations_enabled();
+    let mut compositions = vec![];
+
+    for (idx1, node1) in deduplicated_exressions.iter().enumerate() {
+        for (idx2, node2) in deduplicated_exressions.iter().enumerate() {
+            let comp = compose_expressions(node1, node2);
+            let id = composition_egraph.add_expr(&comp);
+            composition_egraph.set_analysis_data(id, vec![(idx1, idx2)]);
+            compositions.push(((idx1, idx2), comp));
+        }
+    }
+    composition_egraph.rebuild();
+
+    println!("Deduplicating compositions");
+    composition_runner = composition_runner
+        .with_explanations_enabled()
+        .with_egraph(composition_egraph)
+        .run(&make_rules());
+    println!("{}", composition_runner.report());
+
+    let N = deduplicated_exressions.len();
+    let mut problem = Problem::new(OptimizationDirection::Minimize);
+    let mut I = vec![];
+    let mut CI = vec![];
+    let mut AGE = vec![];
+    let mut GOAL = vec![];
+    let two = problem.add_integer_var(0.0, (0, i32::MAX));
+    problem.add_constraint([(two, 1.0)], ComparisonOp::Eq, 2.0);
+
+    composition_egraph = composition_runner.egraph;
+    for (i, node) in deduplicated_exressions.iter().enumerate() {
+        // We need to express a constraint for each node that
+        // CI[idx] == (I[idx] /\ AGE[idx] == 1) \/ ( CI[c1] /\ CI[c2] /\ AGE[idx] = AGE[c1] + AGE[c2])
+        // where we need to add a ( CI[c1] /\ CI[c2] /\ AGE[idx] = AGE[c1] + AGE[c2]) term
+        // for every possible composition pair (c1,c2) that is equivalent to our index
+
+        // For this first iteration we just prepare the generic variables
+        I.push(problem.add_binary_var(1.0));
+        CI.push(problem.add_binary_var(0.0));
+        AGE.push(problem.add_integer_var(0.0, (1, i32::MAX)));
+
+        // This is equivalent to the constraint that Age[i] == 1
+        // since: Age[i] == 1 <=> (Age[i] >= 1 /\ Age[i] < 2)
+        let age_equals_one = add_lt_var(&mut problem, AGE[i], two);
+        // this is the (I[idx] /\ AGE[idx] == 1)
+        let I_and_age = add_and_var(&mut problem, I[i], age_equals_one);
+        GOAL.push(I_and_age);
+    }
+
+    // Now in this pass we add the constrants that allow us to derive expressions from compositions
+    for (i, node) in deduplicated_exressions.iter().enumerate() {
+        println!("Calculating constraint: {i}/{N}");
+        // let mut equivs = vec![];
+        // for ((idx1, idx2), cmp) in compositions.iter() {
+        //     let eq_len = composition_egraph.equivs(&cmp, &node).len();
+        //     if eq_len != 0 {
+        //         equivs.push(((idx1, idx2)));
+        //     }
+        // }
+        let equivs2 = get_composed(&composition_egraph, node);
+        // println!("EQ1: {:?}", equivs.len());
+        println!("EQ2: {:?}", equivs2.len());
+
+        for (c1, c2) in equivs2.into_iter() {
+            println!("Adding equivalence ({c1}, {c2})");
+            if *c1 != *c2 {
+                // The constraint solver does not like cases where the ids are the same
+
+                // The this variable AGE = AGE[c1] + AGE[c2]
+                let age_sum = problem.add_integer_var(0.0, (0, i32::MAX));
+                problem.add_constraint(
+                    [(age_sum, 1.0), (AGE[*c1], -1.0), (AGE[*c2], -1.0)],
+                    ComparisonOp::Eq,
+                    -1.0,
+                );
+                // this is the constraint that AGE[i] < AGE[c1] + AGE[c2]
+                let age_lt_sum = add_lt_var(&mut problem, age_sum, AGE[i]);
+                // This is the constraint that (CI[c1] /\ CI[c2] /\ AGE[i] < AGE[c1] + AGE[c2])
+                let and_1 = add_and_var(&mut problem, CI[*c1], age_lt_sum);
+                let and_2 = add_and_var(&mut problem, CI[*c2], and_1);
+                GOAL[i] = add_or_var(&mut problem, GOAL[i], and_2);
+            } else {
+                // The this variable AGE = AGE[c1] + AGE[c1] (since c1 == c2)
+                let age_sum = problem.add_integer_var(0.0, (0, i32::MAX));
+                problem.add_constraint([(age_sum, 1.0), (AGE[*c1], -2.0)], ComparisonOp::Eq, -1.0);
+                // this is the constraint that AGE[i] < AGE[c1] + AGE[c2]
+                let age_lt_sum = add_lt_var(&mut problem, age_sum, AGE[i]);
+                // This is the constraint that (CI[c1] /\ AGE[i] < AGE[c1] + AGE[c2])
+                let and_c: Variable = add_and_var(&mut problem, CI[*c1], age_lt_sum);
+                GOAL[i] = add_or_var(&mut problem, GOAL[i], and_c);
+            }
+        }
+
+        // Actually make sure that the goals are there!
+        problem.add_constraint([(GOAL[i], 1.0)], ComparisonOp::Eq, 1.0);
+        problem.add_constraint([(GOAL[i], 1.0), (CI[1], -1.0)], ComparisonOp::Eq, 0.0);
+    }
+
+    println!("Solving!");
+    let sol = problem.solve().unwrap();
+    println!("SOLUTION {sol:?}");
+    for (i, _) in deduplicated_exressions.iter().enumerate() {
+        println!(
+            "Idx: {} I:{} CI{} AI;{}",
+            i, sol[I[i]], sol[CI[i]], sol[AGE[i]],
+        )
+    }
+
+    let composed_exressions: Vec<RecExpr<MathLanguage>> = deduplicated_exressions
+        .iter()
+        .enumerate()
+        .filter_map(|(id, expr)| if sol[I[id]] == 1.0 { Some(expr) } else { None })
+        .cloned()
+        .collect();
+
+    println!("Found {} decomposed expressions", composed_exressions.len());
+
+    return composed_exressions;
+}
+
+fn compose_expressions(
+    src: &RecExpr<MathLanguage>,
+    pattern: &RecExpr<MathLanguage>,
+) -> RecExpr<MathLanguage> {
+    let mut res = RecExpr::default();
+    let x = Symbol::from("x");
+    let mut ids: HashMap<Id, Id> = HashMap::with_capacity(src.len());
+
+    for (outer_idx, node) in src.iter().enumerate() {
+        match node {
+            MathLanguage::Thefunc(thefun_id) => {
+                let offset = res.len();
+                let mut x_idx = None;
+                for (idx, pattern_node) in pattern.iter().enumerate() {
+                    let new_node = match pattern_node {
+                        MathLanguage::Symbol(sym) => {
+                            if sym.clone() == x {
+                                x_idx = Some(idx);
+                            }
+                            pattern_node.clone()
+                        }
+                        _ => pattern_node.clone().map_children(|id| match x_idx {
+                            Some(x_id) => {
+                                if (Id::from(x_id) == id) {
+                                    ids[thefun_id]
+                                } else {
+                                    Id::from(offset + usize::from(id))
+                                }
+                            }
+                            None => id,
+                        }),
+                    };
+                    // println!("{:?} adding {:?}", res, new_node);
+                    res.add(new_node);
+                }
+                ids.insert(Id::from(outer_idx), Id::from(res.len() - 1));
+            }
+            _rest => {
+                // println!("Doing node: {node:?} {ids:?} {outer_idx}");
+                let node_moved = node.clone().map_children(|id| ids[&id]);
+                res.add(node_moved);
+                ids.insert(Id::from(outer_idx), Id::from(res.len() - 1));
+            }
+        }
+    }
+    return res;
+}
+
+fn add_and_var(problem: &mut Problem, a: Variable, b: Variable) -> Variable {
+    let and = problem.add_binary_var(0.0);
+    problem.add_constraint([(a, 1.0), (b, 1.0), (and, -2.0)], ComparisonOp::Ge, 0.0);
+    problem.add_constraint([(a, 1.0), (b, 1.0), (and, -2.0)], ComparisonOp::Le, 1.0);
+    return and;
+}
+
+fn add_or_var(problem: &mut Problem, a: Variable, b: Variable) -> Variable {
+    let or = problem.add_binary_var(0.0);
+    problem.add_constraint([(a, 1.0), (b, 1.0), (or, -2.0)], ComparisonOp::Ge, -1.0);
+    problem.add_constraint([(a, 1.0), (b, 1.0), (or, -2.0)], ComparisonOp::Le, 0.0);
+    return or;
+}
+
+fn add_lt_var(problem: &mut Problem, a: Variable, b: Variable) -> Variable {
+    let lt = problem.add_binary_var(0.0);
+    let k = 100000000.0;
+    problem.add_constraint([(a, 1.0), (b, -1.0), (lt, k)], ComparisonOp::Ge, 0.0);
+    problem.add_constraint([(a, 1.0), (b, -1.0), (lt, k)], ComparisonOp::Le, k - 1.0);
+    return lt;
+}
+
+// fn ilp_tests() {
+//     let mut problem = Problem::new(OptimizationDirection::Minimize);
+//     // let c1 = add_bool(&mut problem, 1.0);
+//     // let c2 = add_bool(&mut problem, 1.0);
+
+//     let a1 = problem.add_integer_var(1.0, (1, i32::MAX));
+//     let two = problem.add_integer_var(0.0, (1, i32::MAX));
+
+//     let lt = add_lt_var(&mut problem, a1, two);
+//     problem.add_constraint([(two, 1.0)], ComparisonOp::Eq, 2.0);
+//     problem.add_constraint([(a1, 1.0)], ComparisonOp::Eq, 5.0);
+//     let solution = problem.solve().unwrap();
+//     println!("Solution: {}", solution[lt]);
+//     println!("Solution: {}", solution[a1]);
+//     println!("Solution: {}", solution[two]);
+
+//     // let or = add_or_var(&mut problem, c1, c2);
+//     // let and = add_and_var(&mut problem, c1, c2);
+//     // problem.add_constraint([(c1, 1.0)], ComparisonOp::Eq, 0.0);
+//     // problem.add_constraint([(c2, 1.0)], ComparisonOp::Eq, 1.0);
+
+//     // let solution = problem.solve().unwrap();
+//     // println!("Solution: {}", solution[or]);
+//     // println!("Solution: {}", solution[and]);
+//     // println!("Solution: {}", solution[c1]);
+//     // println!("Solution: {}", solution[c2]);
+//     // subject to constraints: x + y <= 4 and 2 * x + y >= 2.
+// }
+
+// fn paper_constraints_test() {
+//     let mut problem = Problem::new(OptimizationDirection::Minimize);
+//     let mut Is = vec![];
+//     let mut Cs = vec![];
+//     let mut As = vec![];
+
+//     for _i in 0..3 {
+//         Is.push(problem.add_binary_var(1.0));
+//         Cs.push(problem.add_binary_var(0.0));
+//         As.push(problem.add_integer_var(0.0, (1, i32::MAX)));
+//     }
+
+//     let two = problem.add_integer_var(0.0, (0, i32::MAX));
+//     problem.add_constraint([(two, 1.0)], ComparisonOp::Eq, 2.0);
+//     {
+//         let a_eq_1 = add_lt_var(&mut problem, As[0], two);
+//         let and_1_i = add_and_var(&mut problem, Is[0], a_eq_1);
+//         let age_sum_1 = problem.add_integer_var(0.0, (0, i32::MAX));
+//         problem.add_constraint([(age_sum_1, 1.0), (As[1], -2.0)], ComparisonOp::Eq, 0.0);
+//         let age_lt_1 = add_lt_var(&mut problem, age_sum_1, As[0]);
+//         let and_1_c = Cs[1];
+//         let and_2_c = add_and_var(&mut problem, and_1_c, age_lt_1);
+//         let or_1 = add_or_var((&mut problem), and_2_c, and_1_i);
+
+//         problem.add_constraint([(or_1, 1.0)], ComparisonOp::Eq, 1.0);
+//         problem.add_constraint([(or_1, 1.0), (Cs[0], -1.0)], ComparisonOp::Eq, 0.0);
+//     }
+//     {
+//         let a_eq_2 = add_lt_var(&mut problem, As[1], two);
+//         let and_2_i = add_and_var(&mut problem, Is[1], a_eq_2);
+//         problem.add_constraint([(and_2_i, 1.0)], ComparisonOp::Eq, 1.0);
+//         problem.add_constraint([(and_2_i, 1.0), (Cs[1], -1.0)], ComparisonOp::Eq, 0.0);
+//     }
+//     {
+//         let a_eq_1 = add_lt_var(&mut problem, As[2], two);
+//         let and_1_i = add_and_var(&mut problem, Is[2], a_eq_1);
+
+//         let age_sum_1 = problem.add_integer_var(0.0, (0, i32::MAX));
+//         problem.add_constraint([(age_sum_1, 1.0), (As[2], -2.0)], ComparisonOp::Eq, -1.0);
+
+//         let age_lt_1 = add_lt_var(&mut problem, age_sum_1, As[2]);
+//         let and_1_c = Cs[2];
+//         let and_2_c = add_and_var(&mut problem, and_1_c, age_lt_1);
+//         let or_1 = add_or_var((&mut problem), and_2_c, and_1_i);
+//         problem.add_constraint([(or_1, 1.0)], ComparisonOp::Eq, 1.0);
+
+//         problem.add_constraint([(or_1, 1.0), (Cs[2], -1.0)], ComparisonOp::Eq, 0.0);
+//     }
+
+//     let solution = problem.solve().unwrap();
+//     println!("1: {}", solution[Is[0]]);
+//     println!("2: {}", solution[Is[1]]);
+//     println!("3: {}", solution[Is[2]]);
+// }
+
+fn main() {
+    let expr = "(- (tan ?x) (sin ?x))".parse().unwrap();
+    let results = extract_expressions(expr);
+    for res in results {
+        println!("EXPR: {res}");
+    }
+
+    // let expr = "(- (log (+ ?x 1)) (log ?x))".parse().unwrap();
+    // let results = extract_expressions(expr);
+    // for res in results {
+    //     println!("EXPR: {res}");
+    // }
+
+    // let expr = "(/ (- 1 (cos ?x)) (sin ?x))".parse().unwrap();
+    // let results = extract_expressions(expr);
+    // for res in results {
+    //     println!("EXPR: {res}");
+    // }
+
+    // paper_constraints_test();
 }
